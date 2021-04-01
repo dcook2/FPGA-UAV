@@ -1,49 +1,61 @@
-//library for the sonar
+//Library for the sonar
 #include "SR04.h"
-///libraries for the imu
+//Libraries for the imu
 #include <Adafruit_BNO055.h>
 #include <Adafruit_Sensor.h>
-//library for the brushless motors
+//Library for the brushless motors
 #include <Servo.h>
 
-//All distances will be in cm
 //Starting distance: should be the distance from the sonar attached to the drone to the floor
-#define DISTANCE_A 1
-//Distance where the floor no longer affects the thrust of the motors. Should increase the throtttle accordingly to account for this
-#define DISTANCE_B 1
+#define DISTANCE_A 7
+//Distance where the floor no longer affects the thrust of the motors. Should increase the throttle accordingly to account for this
+#define DISTANCE_B 30
 //Peak distance where the drone should be hovering without an increase or decrease in altitude 
-#define DISTANCE_C 1
+#define DISTANCE_C 100
 //Distance where the drone should start decelerating to prepare for landing
-#define DISTANCE_D 1
+#define DISTANCE_D 30
 //Distance just a little bit higher than DISTANCE_A that is used for landing
-#define DISTANCE_E 1
+#define DISTANCE_E 9
 
 //Time for which the drone will hover for
-#define HOVER_TIME 1
+#define HOVER_TIME 10000
 
 //Throttle to account for thrust from the floor
-#define ASCEND_1 1
+#define ASCEND_1 1200
 //Throttle to ascend
-#define ASCEND_2 1
+#define ASCEND_2 1400
 //Throttle to hover
-#define HOVER 1
+#define HOVER 1150
 //Throttle to begin descending 
-#define DESCEND_1 1
+#define DESCEND_1 1100
 //Throttle to finish descending taking the thrust from the floor into account
-#define DESCEND_2 1
+#define DESCEND_2 1050
 //Throttle to turn motors off
-#define LANDED 0
+#define LANDED 1000
 //Maximum throttle, used to initialize the esc's 
 #define MAX 1023
 
 //Pins for the trigger and echo of the sonar
-#define TRIGGER_PIN 1
+#define TRIGGER_PIN 12
 #define ECHO_PIN 2
 
-//global variable for the distance that the sonar reads. Volitile so it can be used in the interrupt
-volatile long distance;
+//Pins for the four different motors
+#define FRONT_RIGHT 3
+#define FRONT_LEFT 4
+#define BACK_RIGHT 5
+#define BACK_LEFT 6
+
+//Killswitch
+#define BUTTON 19
+
+
+
+//Global variable for the distance that the sonar reads. Volatile so it can be used in the interrupt
+long distance;
+long previousDistance;
 
 /*Global variable to determine and change the state of the drone
+ * 
  * 0: Starting state, will configure the esc's and test motors
  * 1: Begin ascent state, will begin to ascend with a throttle that takes the thrust from the floor into account
  * -Distance should be greater or equal to A and less than B
@@ -60,19 +72,38 @@ volatile long distance;
 volatile int currentState;
 
 //Global variables for the IMU and PID
-volatile float xAxis;
-volatile float yAxis;
-volatile float zAxis;
-volatile float xAccel;
-volatile float yAccel;
-volatile float zAccel;
+float roll_p_gain = 1.3;
+float roll_i_gain = 0.04;
+float roll_d_gain = 18.0;
+int roll_max = 400; 
+
+float pitch_p_gain = roll_p_gain;
+float pitch_i_gain = roll_i_gain;
+float pitch_d_gain = roll_d_gain;
+int pitch_max = roll_max;
+
+float yaw_p_gain = 4.0;
+float yaw_i_gain = 0.02;
+float yaw_d_gain = 0.0;
+int yaw_max = 400;
+
+//Enables and disables the PID loop
+boolean auto_level = true;
+
+float temp_error;
+float roll_input, roll_setpoint, roll_i, roll_d, roll_output;
+float pitch_input, pitch_setpoint, pitch_i, pitch_d, pitch_output;
+float yaw_input, yaw_setpoint, yaw_i, yaw_d, yaw_output;
+
 
 //Code for ESC's and Motors
-int motorPins[] = {};
+int motorPins[] = {FRONT_RIGHT, FRONT_LEFT, BACK_RIGHT, BACK_LEFT};
 int throttle = 0;
 int startup = 5000;
+int FR_THROTTLE, BR_THROTTLE, FL_THROTTLE, BL_THROTTLE;
 
-//initializing the 4 Servo instances
+
+//Initializing the 4 Servo instances
 Servo motor[4];
 
 //Sonar instance for the SR04 class
@@ -82,11 +113,15 @@ SR04 sonar = SR04(ECHO_PIN,TRIGGER_PIN);
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 
 void setup() {
+  
   Serial.begin(9600);
 
   //defining the interrupt routine
-  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), changeState, CHANGE);
-  currentState = 0;
+  //attachInterrupt(digitalPinToInterrupt(ECHO_PIN), changeState, CHANGE);
+
+  attachInterrupt(digitalPinToInterrupt(BUTTON), kill, CHANGE);
+  
+  currentState = 1;
 
   //attaching the Servo instances to the pins of the motors
   for(int i = 0; i < 4; i++){
@@ -101,185 +136,399 @@ void setup() {
   }
   delay(1000);
   bno.setExtCrystalUse(true);
+  
 }
 
 void loop() {
-  //firt it will set up the ESC's, then the functionality of the state diagram will occur
-  //Currently set to 7 so that it will not reach this code
-  if(currentState == 7){
-  //if less than 15 seconds have passed
-   if(millis()-startup<15000){
-    throttle = MAX;
-    throttle = map(throttle,0,MAX,1000,2000);
-    for(int i = 0; i < 4; i++){
-      motor[i].writeMicroseconds(throttle);
-    }
-    Serial.println("HIGH");
-    }else{
-      throttle = 0;
+  
+  //Firt it will set up the ESC's, then the functionality of the state diagram will occur
+  if(currentState == 0){
+    
+    if(millis()-startup<15000){
+      
+      throttle = MAX;
       throttle = map(throttle,0,MAX,1000,2000);
+    
       for(int i = 0; i < 4; i++){
         motor[i].writeMicroseconds(throttle);
       }
-      Serial.println("LOW");
+    
+      Serial.println("HIGH");
+    
     }
+    else {
+      
+      throttle = 0;
+      throttle = map(throttle,0,MAX,1000,2000);
+      
+      for(int i = 0; i < 4; i++){
+        motor[i].writeMicroseconds(throttle);
+      }
+      
+      Serial.println("LOW");
+      
+    }
+    
     delay(5);
 
-    if(millis()-startup>30000){
-      currentState == 1;
-    }
-  }else{
+    if(millis()-startup>30000)
+      currentState = 1;
+    
+  }
+  else {
 
-    //checks before the sonar reads in order to prevent the state transition interrupt
+    //Checks before the sonar reads in order to prevent the state transition interrupt
     if(currentState == 3){
+      
       //Code to have the drone hover for set amount of time
       delay(HOVER_TIME);
     
       currentState = 4;
+      
     }
 
-    //Getting the axis orientation from the IMU
-    sensors_event_t event; 
-    bno.getEvent(&event);
 
-    xAxis = event.orientation.x;
-    yAxis = event.orientation.y;
-    zAxis = event.orientation.z;
-  
-  
     //Getting the distance from the sonar
-    distance = sonar.Distance();
+    distance = correctSonar();
+//    Serial.print("distance ");
+//    Serial.print(distance);
+//    Serial.print("    currentState ");
+//    Serial.print(currentState);
+    Serial.print("    throttle ");
+    Serial.print(throttle);
+    Serial.print("    FR throttle ");
+    Serial.print(FR_THROTTLE);
+    Serial.print("    FL throttle ");
+    Serial.print(FL_THROTTLE);
+    Serial.print("    BR throttle ");
+    Serial.print(BR_THROTTLE);
+    Serial.print("    BL throttle ");
+    Serial.println(BL_THROTTLE);
     delay(50);
-  }
-  
-}
 
-void changeState() {
-  
-  switch(currentState)
-  {
-//    case 0:
-//      //Code for initializing esc's
-//
-//      currentState = 1;
-//      break;
-
-    case 1:
-      if(distance >= DISTANCE_A && distance < DISTANCE_B)
-      {
-        //Code for setting throttle to account for increased thrust from the floor
-
-        throttle = ASCEND_1;
-        
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+    //S
+    switch(currentState)
+    {
+      case 1:
+        if(distance >= DISTANCE_A && distance < DISTANCE_B)
+        {
+                     
+          //Code for setting throttle to account for increased thrust from the floor
+          throttle = ASCEND_1;
+          
+          if(millis() - startup < 15000)
+            throttle = 1000; 
+           
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
     
-      }
-      else if(distance >= DISTANCE_B)
-      {
-        currentState = 2;
-      }
+        }
+        else if(distance >= DISTANCE_B)
+        {
+          currentState = 2;
+        }
       
       break;
-    case 2:
-      if(distance >= DISTANCE_B && distance < DISTANCE_C)
-      {
-        //Code for setting throttle to account for increased thrust from the floor
-
-        throttle = ASCEND_2;
+      
+      case 2:
+        if(distance >= DISTANCE_B && distance < DISTANCE_C)
+        {
         
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+          //Code for setting throttle to account for increased thrust from the floor
+          throttle = ASCEND_2;
+        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
           
-      }
-      else if(distance >= DISTANCE_C)
-      {
-        currentState = 3;
-      }
+        }
+        else if(distance >= DISTANCE_C)
+        {
+          currentState = 3;
+        }
       
       break;
-    case 3:
-      if(distance >= DISTANCE_C)
-      {
-        //Code for setting the throttle to hover the drone
-
-        throttle = HOVER;
+      
+      case 3:
+        if(distance >= DISTANCE_C)
+        {
         
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+          //Code for setting the throttle to hover the drone
+          throttle = HOVER;
+        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
 
-      }
+        }
       
       break;
-    case 4:
-      if(distance >= DISTANCE_D && distance < DISTANCE_C)
-      {
-        //Code for setting throttle to begin descinding 
-
-        throttle = DESCEND_1;
+      
+      case 4:
+        if(distance >= DISTANCE_D && distance < DISTANCE_C)
+        {
         
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+          //Code for setting throttle to begin descinding 
+          throttle = DESCEND_1;
+        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
           
-      }
-      else if(distance <= DISTANCE_D)
-      {
-        currentState = 5;
-      }
+        }
+        else if(distance <= DISTANCE_D)
+        {
+          currentState = 5;
+        }
       
       break;
-    case 5:
-      if(distance > DISTANCE_A && distance <= DISTANCE_D)
-      {
-        //Code for setting throttle to begin landing. Will have to take the thrust from the floor into account here as well
-
-        throttle = DESCEND_2;
+      
+      case 5:
+        if(distance > DISTANCE_A && distance <= DISTANCE_D)
+        {
         
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+          //Code for setting throttle to begin landing. Will have to take the thrust from the floor into account here as well
+          throttle = DESCEND_2;
+        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
           
-      }
-      else if(distance < DISTANCE_E)
-      {
-        currentState = 6;
-      }
+        }
+        else if(distance < DISTANCE_E)
+        {
+          currentState = 6;
+        }
       break;
       
-    case 6:
-        //Code for when the drone has landed
-
-        throttle = LANDED;
+      case 6:
+          //Code for when the drone has landed
+          throttle = LANDED;
         
-        for(int i = 0; i < 4; i++)
-          motor[i].writeMicroseconds(throttle);
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
           
       break;
+      
+    }
+
+    if(auto_level){
+    
+      //reseting pid oontrollers
+      roll_i = 0;
+      roll_d = 0;
+      pitch_i = 0;
+      pitch_d = 0;
+      yaw_i = 0;
+      yaw_d = 0;
+    
+      //Calling the PID loop for auto-correction
+      PID();
+
+      if (throttle > 1800) throttle = 1800;                                   //We need some room to keep full control at full throttle.
+      FR_THROTTLE = throttle - pitch_output + roll_output - yaw_output; //Calculate the pulse for esc 1 (front-right - CCW)
+      BR_THROTTLE = throttle + pitch_output + roll_output + yaw_output; //Calculate the pulse for esc 2 (rear-right - CW)
+      BL_THROTTLE = throttle + pitch_output - roll_output - yaw_output; //Calculate the pulse for esc 3 (rear-left - CCW)
+      FL_THROTTLE = throttle - pitch_output - roll_output + yaw_output; //Calculate the pulse for esc 4 (front-left - CW)
+
+      if(millis() - startup < 15000){
+            throttle = 1000; 
+            for(int i = 0; i < 4; i++)
+          motor[i].writeMicroseconds(throttle);   
+      }
+      else{
+      motor[0].writeMicroseconds(FR_THROTTLE);
+      motor[1].writeMicroseconds(FL_THROTTLE);
+      motor[2].writeMicroseconds(BR_THROTTLE);
+      motor[3].writeMicroseconds(BL_THROTTLE);
+      }
+    }
+    else{
+      for(int i = 0; i < 4; i++)
+        motor[i].writeMicroseconds(throttle);   
+    }
   }
+  
 }
 
+//Currently not in use
+//void changeState() {
+//  
+//  switch(currentState)
+//  {
+//    case 1:
+//      if(distance >= DISTANCE_A && distance < DISTANCE_B)
+//      {
+//        
+//        //Code for setting throttle to account for increased thrust from the floor
+//        throttle = ASCEND_1;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//    
+//      }
+//      else if(distance >= DISTANCE_B)
+//      {
+//        currentState = 2;
+//      }
+//      
+//      break;
+//      
+//    case 2:
+//      if(distance >= DISTANCE_B && distance < DISTANCE_C)
+//      {
+//        
+//        //Code for setting throttle to account for increased thrust from the floor
+//        throttle = ASCEND_2;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//          
+//      }
+//      else if(distance >= DISTANCE_C)
+//      {
+//        currentState = 3;
+//      }
+//      
+//      break;
+//      
+//    case 3:
+//      if(distance >= DISTANCE_C)
+//      {
+//        
+//        //Code for setting the throttle to hover the drone
+//        throttle = HOVER;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//
+//      }
+//      
+//      break;
+//      
+//    case 4:
+//      if(distance >= DISTANCE_D && distance < DISTANCE_C)
+//      {
+//        
+//        //Code for setting throttle to begin descinding 
+//        throttle = DESCEND_1;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//          
+//      }
+//      else if(distance <= DISTANCE_D)
+//      {
+//        currentState = 5;
+//      }
+//      
+//      break;
+//      
+//    case 5:
+//      if(distance > DISTANCE_A && distance <= DISTANCE_D)
+//      {
+//        
+//        //Code for setting throttle to begin landing. Will have to take the thrust from the floor into account here as well
+//        throttle = DESCEND_2;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//          
+//      }
+//      else if(distance < DISTANCE_E)
+//      {
+//        currentState = 6;
+//      }
+//      break;
+//      
+//    case 6:
+//        //Code for when the drone has landed
+//        throttle = LANDED;
+//        
+//        for(int i = 0; i < 4; i++)
+//          motor[i].writeMicroseconds(throttle);
+//          
+//      break;
+//      
+//  }
+//  
+//}
+
+
+//Function for the PID loop that corrects the orientation of the drone
 void PID() {
   
-  float pitch = 0;
-  float roll = 0;
-  float yaw = 0;
+  //Getting the axis orientation from the IMU
+  sensors_event_t event; 
+  bno.getEvent(&event);
 
-  pitch = 180 * atan(xAccel/sqrt(yAccel*yAccel + zAccel * zAccel))/3.14159265358979323846;
-  yaw =  180 * atan(zAccel/sqrt(xAccel*xAccel + yAccel * yAccel))/3.14159265358979323846;
-  roll = 180 * atan(yAccel/sqrt(xAccel*xAccel + zAccel * zAccel))/3.14159265358979323846;
+  roll_input = event.orientation.x;
+  pitch_input = event.orientation.y;
+  yaw_input = event.orientation.z;
+
+  //Roll PID calculation
+  temp_error = roll_input - roll_setpoint;
+  roll_i += roll_i_gain* temp_error;
+  if (roll_i > roll_max)
+    roll_i = roll_max;
+  else if(roll_i < roll_max * -1)
+    roll_output = roll_max * -1;
+
+  roll_output = roll_p_gain * temp_error + roll_i + roll_d_gain * (temp_error - roll_d);
+  if(roll_output > roll_max)
+    roll_output = roll_max;
+  else if (roll_output < roll_max * -1)
+    roll_output = roll_max * -1;
+
+  roll_d = temp_error;
+
+  //Pitch PID calculation
+  temp_error = pitch_input - pitch_setpoint;
+  pitch_i += pitch_i_gain* temp_error;
+  if (pitch_i> pitch_max)
+    pitch_i = pitch_max;
+  else if(pitch_i < pitch_max * -1)
+    pitch_output = pitch_max * -1;
+
+  pitch_output = pitch_p_gain * temp_error + pitch_i + pitch_d_gain * (temp_error - pitch_d);
+  if(pitch_output > pitch_max)
+    pitch_output = pitch_max;
+  else if (pitch_output < pitch_max * -1)
+    pitch_output = pitch_max * -1;
+
+  pitch_d = temp_error;
+   
+  //Yaw PID calculation
+  temp_error = yaw_input - yaw_setpoint;
+  yaw_i += yaw_i_gain* temp_error;
+  if (yaw_i> yaw_max)
+    yaw_i = yaw_max;
+  else if(yaw_i < yaw_max * -1)
+    yaw_output = yaw_max * -1;
+
+  yaw_output = yaw_p_gain * temp_error + yaw_i + yaw_d_gain * (temp_error - yaw_d);
+  if(yaw_output > yaw_max)
+    yaw_output = yaw_max;
+  else if (yaw_output < yaw_max * -1)
+    yaw_output = yaw_max * -1;
+
+  yaw_d = temp_error;
+  
   
 }
 
-float correctSonar(int dist) {
-  int Maximum = 0;
-  int Minimum = 0;
+//Function to ensure that no 'trash' values are passed to the interrupt
+float correctSonar() {
+  
+  int Maximum = 400;
+  int Minimum = 6; 
 
-  int returnVal = 0;
-
-  if(distance < Maximum && dist > minimum) {
-   return distance; 
-    
+  int dist = sonar.Distance();
+  
+  if(dist < Maximum && dist > Minimum) {
+   previousDistance = dist;  
+   return dist;   
   }
 
-  return returnVal;
-  
+  return previousDistance;
+}
+
+void kill() {
+  currentState = 6;
 }
